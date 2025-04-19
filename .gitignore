@@ -1,4 +1,4 @@
 .env
 main
 bbs-go
-bin/*
+bin/

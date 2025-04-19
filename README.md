@@ -1,12 +1,12 @@
 # bbs-go
 
-A tiny TCP server implementing a basic Buletin Board Service. 
+A tiny TCP server implementing a basic Buletin Board Service.
 
-```
-$ telnet localhost 5555
+```shell
+telnet localhost 5555
 ```
 
-```
+```text
 +-------------------------------------------+
 |       __    __                            |
 |      / /_  / /_  _____      ____  ____    |
@@ -28,7 +28,7 @@ telnet localhost 5555
 
 ## build and run
 
-```
+```shell
 # Copy example dotenv file
 cp .env.example .env
 
@@ -44,5 +44,4 @@ make run
 + message boards
 + TUI forums
 + online games
-+ user administration 
-
++ user administration

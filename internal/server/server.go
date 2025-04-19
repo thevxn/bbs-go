@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -133,7 +134,7 @@ func (s *Server) init() {
 //
 
 // Common debug info logging wrapper function.
-func (s *Server) debugf(format string, args ...interface{}) {
+func (s *Server) debugf(format string, args ...any) {
 	if s.outputTarget == nil || !config.Debug {
 		return
 	}
@@ -146,7 +147,7 @@ func (s *Server) debugf(format string, args ...interface{}) {
 }
 
 // Common basic logging wrapper function.
-func (s *Server) logf(format string, args ...interface{}) {
+func (s *Server) logf(format string, args ...any) {
 	if s.outputTarget == nil {
 		return
 	}
@@ -170,6 +171,10 @@ func (s *Server) listen() {
 		l.Close()
 	}()
 
+	// Ensure the welcome message contains carriage return + line feed
+	// Needed to display properly on Windows terminals
+	WelcomeMessage = strings.ReplaceAll(WelcomeMessage, "\n", "\r\n")
+
 	s.logf("%s", WelcomeMessage)
 	s.logf("*** Listening on port TCP/%d...", config.Port)
 
@@ -189,7 +194,7 @@ func (s *Server) listen() {
 			// Set the conn deadline.
 			//conn.SetDeadline(time.Now().Add(ConnectionTimeout))
 
-			// Handle the connectiopn in a new goroutine.
+			// Handle the connection in a new goroutine.
 			// --> internal/server/handler.go
 			handler := &Handler{
 				done:   s.done,
@@ -204,9 +209,5 @@ func (s *Server) listen() {
 	}()
 
 	// Wait until the shutdown is invoked.
-	select {
-	case <-s.done:
-	}
-
-	return
+	<-s.done
 }

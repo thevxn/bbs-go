@@ -4,12 +4,43 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strings"
 	"sync"
 
 	"go.vxn.dev/bbs-go/internal/config"
 )
+
+const prompt = "> "
+const crlf = "\r\n"
+const shutdownMessage = "Shutdown" + crlf
+const byeMessage = "*** Bye" + crlf
+const helpMessage = "*** Commands" + crlf +
+	"    exit --- quit the session" + crlf + crlf
+const invalidCommandMessage = "*** Invalid command, try 'help'" + crlf
+
+// stripTelnetNegotiation removes Telnet command sequences from incoming data.
+// These sequences begin with the IAC (Interpret As Command) byte (decimal 255),
+// followed by one or more bytes indicating Telnet negotiation options (e.g., WILL, DO, etc.).
+// See RFC 854 for details: https://datatracker.ietf.org/doc/html/rfc854
+func stripTelnetNegotiation(data []byte) []byte {
+	result := []byte{}
+	i := 0
+	for i < len(data) {
+		if data[i] == 255 { // IAC
+			// Telnet command structure is typically IAC <command> <option>
+			// So skip the next two bytes (if available)
+			if i+2 < len(data) {
+				i += 3
+			} else {
+				break
+			}
+		} else {
+			result = append(result, data[i])
+			i++
+		}
+	}
+	return result
+}
 
 type Handler struct {
 	//ctx context.Context
@@ -19,12 +50,19 @@ type Handler struct {
 	wg     *sync.WaitGroup
 }
 
+// write writes data to the Handler's client connection. Any error returned is logged.
+func (h *Handler) write(data string) {
+	if _, err := h.conn.Write([]byte(data)); err != nil {
+		h.debugf("Write error: %s", err.Error())
+	}
+}
+
 func (h *Handler) Handle() {
 	defer h.wg.Done()
 
 	h.logf("< Incoming connection: %s", h.conn.RemoteAddr().String())
-	h.conn.Write([]byte(WelcomeMessage))
-	h.conn.Write([]byte("> "))
+	h.write(WelcomeMessage)
+	h.write(prompt)
 
 	defer h.conn.Close()
 
@@ -44,24 +82,12 @@ func (h *Handler) read(pktChan chan string, errChan chan error) {
 	defer h.wg.Done()
 	defer h.debugf("Handler: read closed")
 
-	// Prepare packet's byte allocation.
-	tmp := make([]byte, 512)
-
-	var (
-		err      error
-		haltRead bool
-	)
-
 	// Run the read loop.
 	for {
-		// Halt the loop on any read error.
-		if haltRead {
-			break
-		}
 
 		select {
 		case <-h.done:
-			h.conn.Write([]byte("Shutdown\n"))
+			h.write(shutdownMessage)
 			h.logf("> Connection closed (daemon's shutdown): %s", h.conn.RemoteAddr().String())
 
 			if errChan != nil {
@@ -75,46 +101,48 @@ func (h *Handler) read(pktChan chan string, errChan chan error) {
 			return
 
 		default:
-			// Read bytes from the remote conterpart.
-			if _, err = h.conn.Read(tmp); err != nil {
-				haltRead = true
-				continue
-			}
+			// Prepare packet's byte allocation.
+			tmp := make([]byte, 512)
+			buf := strings.Builder{}
 
-			// ASCII code for a newline is 10.
-			if slices.Contains(tmp, 10) {
-				if pktChan != nil {
-					pktChan <- string(tmp)
+			// Read bytes from the remote conterpart.
+			for {
+				n, err := h.conn.Read(tmp)
+
+				// Handle error from the read loop.
+				if err != nil {
+					switch err {
+					case io.EOF:
+						// End-of-file
+						h.debugf("< EOF")
+
+					case err.(net.Error):
+						h.write("Too slow\n")
+						h.debugf("> Connection closed (read timeout): %s", h.conn.RemoteAddr().String())
+						return
+
+					default:
+						h.debugf("< Unexpected read error: %s", err.Error())
+						return
+					}
+				}
+
+				for i := range n {
+					b := tmp[i]
+
+					// CR or LF indicates end of line
+					if b == '\n' {
+						line := stripTelnetNegotiation([]byte(buf.String()))
+						if pktChan != nil && len(line) > 0 {
+							pktChan <- string(line)
+						}
+						buf.Reset()
+					} else if b != '\r' {
+						buf.WriteByte(b)
+					}
 				}
 			}
 		}
-	}
-
-	// Handle error from the read loop.
-	if err != nil {
-		switch err {
-		case io.EOF:
-			// End-of-file
-			h.debugf("< EOF")
-
-		case err.(net.Error):
-			if _, werr := h.conn.Write([]byte("Too slow\n")); werr != nil {
-				h.debugf("Write error: %s", werr.Error())
-				return
-			}
-
-			h.debugf("> Connection closed (read timeout): %s", h.conn.RemoteAddr().String())
-			return
-
-		default:
-			h.debugf("< Unexpected read error: %s", err.Error())
-			return
-		}
-	}
-
-	if errChan != nil {
-		errChan <- err
-		close(errChan)
 	}
 }
 
@@ -132,7 +160,7 @@ func (h *Handler) route(pktChan chan string, errChan chan error) {
 	for {
 		select {
 		case <-h.done:
-			h.conn.Write([]byte("Shutdown\n"))
+			h.write(shutdownMessage)
 			h.logf("> Connection closed (daemon's shutdown): %s", h.conn.RemoteAddr().String())
 			return
 
@@ -142,32 +170,32 @@ func (h *Handler) route(pktChan chan string, errChan chan error) {
 		default:
 			// Preprocess the string for switch.
 			pkt := <-pktChan
-			parts := strings.Split(pkt, "\n")
+			// h.debugf("pkt: %s", pkt)
+			// h.debugf("pkt: %v", []byte(pkt))
+			parts := strings.Split(pkt, "\r\n")
 
 			switch strings.TrimSpace(parts[0]) {
 			case "":
 
 			case "exit":
-				h.conn.Write([]byte("*** Bye\n\n"))
+				h.write(byeMessage)
 				return
 
 			case "help":
-				h.conn.Write([]byte("*** Commands\n"))
-				h.conn.Write([]byte("    exit --- quit the session\n"))
-				h.conn.Write([]byte("\n"))
+				h.write(helpMessage)
 
 			default:
 				h.debugf("Invalid command")
-				h.conn.Write([]byte("*** Invalid command, try 'help'\n\n"))
+				h.write(invalidCommandMessage)
 			}
 
-			h.conn.Write([]byte("> "))
+			h.write(prompt)
 		}
 	}
 }
 
 // Common debug info logging wrapper function.
-func (h *Handler) debugf(format string, args ...interface{}) {
+func (h *Handler) debugf(format string, args ...any) {
 	if h.output == nil || !config.Debug {
 		return
 	}
@@ -180,7 +208,7 @@ func (h *Handler) debugf(format string, args ...interface{}) {
 }
 
 // Common basic logging wrapper function.
-func (h *Handler) logf(format string, args ...interface{}) {
+func (h *Handler) logf(format string, args ...any) {
 	if h.output == nil {
 		return
 	}
