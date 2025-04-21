@@ -3,7 +3,7 @@
 A tiny TCP server implementing a basic Buletin Board Service.
 
 ```shell
-telnet localhost 5555
+telnet localhost 2323
 ```
 
 ```text
