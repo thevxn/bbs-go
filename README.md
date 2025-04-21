@@ -3,7 +3,7 @@
 A tiny TCP server implementing a basic Buletin Board Service.
 
 ```shell
-telnet localhost 5555
+telnet localhost 2323
 ```
 
 ```text
@@ -17,13 +17,19 @@ telnet localhost 5555
 |                                           |
 +-------------------------------------------+
 vxn-dev bbs-go service (0.6.1)
-telnet localhost 5555
+telnet localhost 2323
 
-> test
-*** Invalid command
+Enter username (or type 'register'): register
+Choose a username: noarche
+Choose a password:
+Registration successful.
+> help
+*** Commands:
+    help           --- show this help message
+    post <message> --- post a message to the board
+    read           --- read recent messages
+    exit           --- quit the session
 
-> exit
-*** Bye
 ```
 
 ## build and run

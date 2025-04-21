@@ -1,71 +1,61 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
-	"go.vxn.dev/bbs-go/internal/config"
+	"bbs-go/internal/config"
 )
 
-const prompt = "> "
-const crlf = "\r\n"
-const shutdownMessage = "Shutdown" + crlf
-const byeMessage = "*** Bye" + crlf
-const helpMessage = "*** Commands" + crlf +
-	"    exit --- quit the session" + crlf + crlf
-const invalidCommandMessage = "*** Invalid command, try 'help'" + crlf
-
-// stripTelnetNegotiation removes Telnet command sequences from incoming data.
-// These sequences begin with the IAC (Interpret As Command) byte (decimal 255),
-// followed by one or more bytes indicating Telnet negotiation options (e.g., WILL, DO, etc.).
-// See RFC 854 for details: https://datatracker.ietf.org/doc/html/rfc854
-func stripTelnetNegotiation(data []byte) []byte {
-	result := []byte{}
-	i := 0
-	for i < len(data) {
-		if data[i] == 255 { // IAC
-			// Telnet command structure is typically IAC <command> <option>
-			// So skip the next two bytes (if available)
-			if i+2 < len(data) {
-				i += 3
-			} else {
-				break
-			}
-		} else {
-			result = append(result, data[i])
-			i++
-		}
-	}
-	return result
+type Message struct {
+	User      string
+	Timestamp string
+	Content   string
 }
 
+type User struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+var (
+	messageStore []Message
+	messageMutex sync.Mutex
+	userDB       = "users.json"
+	users        = map[string]string{}
+	usersMutex   sync.Mutex
+	messagesFile = "messages.txt"
+	motdFile     = "motd.txt"
+)
+
 type Handler struct {
-	//ctx context.Context
-	done   chan struct{}
 	conn   net.Conn
 	output io.Writer
 	wg     *sync.WaitGroup
-}
-
-// write writes data to the Handler's client connection. Any error returned is logged.
-func (h *Handler) write(data string) {
-	if _, err := h.conn.Write([]byte(data)); err != nil {
-		h.debugf("Write error: %s", err.Error())
-	}
+	done   chan struct{}
+	user   string
 }
 
 func (h *Handler) Handle() {
 	defer h.wg.Done()
-
-	h.logf("< Incoming connection: %s", h.conn.RemoteAddr().String())
-	h.write(WelcomeMessage)
-	h.write(prompt)
-
 	defer h.conn.Close()
 
+	h.done = make(chan struct{})
+	h.loadUsers()
+	h.loadMessages()
+
+	h.logf("< Incoming connection: %s", h.conn.RemoteAddr().String())
+
+	h.showMOTD()
+	h.authenticate()
+
+	h.conn.Write([]byte("> "))
 	pktChan := make(chan string)
 	errChan := make(chan error)
 
@@ -74,73 +64,89 @@ func (h *Handler) Handle() {
 	go h.read(pktChan, errChan)
 
 	<-errChan
-
 	h.logf("> Connection closed: %s", h.conn.RemoteAddr().String())
+}
+
+func (h *Handler) loadUsers() {
+	data, err := os.ReadFile(userDB)
+	if err == nil {
+		json.Unmarshal(data, &users)
+	}
+}
+
+func (h *Handler) saveUsers() {
+	usersMutex.Lock()
+	defer usersMutex.Unlock()
+
+	data, _ := json.MarshalIndent(users, "", "  ")
+	_ = os.WriteFile(userDB, data, 0644)
+}
+
+func (h *Handler) authenticate() {
+	h.conn.Write([]byte("Enter username (or type 'register'): "))
+	username := h.readLine()
+	if username == "register" {
+		h.conn.Write([]byte("Choose a username: "))
+		username = h.readLine()
+		h.conn.Write([]byte("Choose a password: "))
+		password := h.readLine()
+
+		usersMutex.Lock()
+		users[username] = password
+		usersMutex.Unlock()
+		h.saveUsers()
+		h.conn.Write([]byte("Registration successful.\n"))
+	} else {
+		h.conn.Write([]byte("Enter password: "))
+		password := h.readLine()
+
+		if stored, ok := users[username]; !ok || stored != password {
+			h.conn.Write([]byte("Login failed. Goodbye.\n"))
+			h.conn.Close()
+			return
+		}
+		h.conn.Write([]byte(fmt.Sprintf("Welcome back, %s!\n", username)))
+	}
+
+	h.user = username
+}
+
+func (h *Handler) showMOTD() {
+	motd, err := os.ReadFile(motdFile)
+	if err == nil {
+		h.conn.Write(motd)
+		h.conn.Write([]byte("\n"))
+	}
+}
+
+func (h *Handler) readLine() string {
+	buf := make([]byte, 256)
+	n, _ := h.conn.Read(buf)
+	return strings.TrimSpace(string(buf[:n]))
 }
 
 func (h *Handler) read(pktChan chan string, errChan chan error) {
 	defer h.wg.Done()
 	defer h.debugf("Handler: read closed")
 
-	// Run the read loop.
-	for {
+	buf := make([]byte, 512)
 
+	for {
 		select {
 		case <-h.done:
-			h.write(shutdownMessage)
-			h.logf("> Connection closed (daemon's shutdown): %s", h.conn.RemoteAddr().String())
-
-			if errChan != nil {
-				errChan <- nil
-				close(errChan)
-			}
-
-			return
-
-		case <-errChan:
+			h.conn.Write([]byte("Shutdown\n"))
+			sendErr(errChan, nil)
 			return
 
 		default:
-			// Prepare packet's byte allocation.
-			tmp := make([]byte, 512)
-			buf := strings.Builder{}
-
-			// Read bytes from the remote conterpart.
-			for {
-				n, err := h.conn.Read(tmp)
-
-				// Handle error from the read loop.
-				if err != nil {
-					switch err {
-					case io.EOF:
-						// End-of-file
-						h.debugf("< EOF")
-
-					case err.(net.Error):
-						h.write("Too slow\n")
-						h.debugf("> Connection closed (read timeout): %s", h.conn.RemoteAddr().String())
-						return
-
-					default:
-						h.debugf("< Unexpected read error: %s", err.Error())
-						return
-					}
-				}
-
-				for i := range n {
-					b := tmp[i]
-
-					// CR or LF indicates end of line
-					if b == '\n' {
-						line := stripTelnetNegotiation([]byte(buf.String()))
-						if pktChan != nil && len(line) > 0 {
-							pktChan <- string(line)
-						}
-						buf.Reset()
-					} else if b != '\r' {
-						buf.WriteByte(b)
-					}
-				}
+			n, err := h.conn.Read(buf)
+			if err != nil {
+				sendErr(errChan, err)
+				return
+			}
+			input := strings.TrimSpace(string(buf[:n]))
+			if input != "" {
+				pktChan <- input
 			}
 		}
 	}
@@ -149,70 +155,141 @@ func (h *Handler) read(pktChan chan string, errChan chan error) {
 func (h *Handler) route(pktChan chan string, errChan chan error) {
 	defer h.wg.Done()
 	defer h.debugf("Handler: route closed")
-
-	defer func() {
-		if errChan != nil {
-			errChan <- nil
-			close(errChan)
-		}
-	}()
+	defer sendErr(errChan, nil)
 
 	for {
 		select {
 		case <-h.done:
-			h.write(shutdownMessage)
-			h.logf("> Connection closed (daemon's shutdown): %s", h.conn.RemoteAddr().String())
 			return
 
-		case <-errChan:
-			return
+		case pkt := <-pktChan:
+			cmd := strings.ToLower(pkt)
 
-		default:
-			// Preprocess the string for switch.
-			pkt := <-pktChan
-			// h.debugf("pkt: %s", pkt)
-			// h.debugf("pkt: %v", []byte(pkt))
-			parts := strings.Split(pkt, "\r\n")
-
-			switch strings.TrimSpace(parts[0]) {
-			case "":
-
-			case "exit":
-				h.write(byeMessage)
+			switch {
+			case cmd == "exit":
+				h.conn.Write([]byte("Bye!\n"))
 				return
 
-			case "help":
-				h.write(helpMessage)
+			case cmd == "help":
+				h.conn.Write([]byte("*** Commands:\n"))
+				h.conn.Write([]byte("    help           --- show this help message\n"))
+				h.conn.Write([]byte("    post <message> --- post a message to the board\n"))
+				h.conn.Write([]byte("    read           --- read recent messages\n"))
+				h.conn.Write([]byte("    exit           --- quit the session\n\n"))
+
+			case strings.HasPrefix(cmd, "post "):
+				content := strings.TrimSpace(pkt[5:])
+				if content == "" {
+					h.conn.Write([]byte("Usage: post <message>\n"))
+				} else {
+					h.saveMessage(h.user, content)
+					h.conn.Write([]byte("Message posted.\n"))
+				}
+
+			case cmd == "read":
+				messages := h.getLastMessages(config.MaxReadMessages)
+				if len(messages) == 0 {
+					h.conn.Write([]byte("No messages yet.\n"))
+				} else {
+					for _, msg := range messages {
+						h.conn.Write([]byte(fmt.Sprintf("[%s] %s: %s\n", msg.Timestamp, msg.User, msg.Content)))
+					}
+				}
 
 			default:
-				h.debugf("Invalid command")
-				h.write(invalidCommandMessage)
+				h.conn.Write([]byte("*** Invalid command, try 'help'\n"))
 			}
 
-			h.write(prompt)
+			h.conn.Write([]byte("> "))
 		}
 	}
 }
 
-// Common debug info logging wrapper function.
-func (h *Handler) debugf(format string, args ...any) {
+func (h *Handler) saveMessage(user, content string) {
+	msg := Message{
+		User:      user,
+		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+		Content:   content,
+	}
+
+	messageMutex.Lock()
+	messageStore = append(messageStore, msg)
+
+	f, err := os.OpenFile(messagesFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		f.WriteString(fmt.Sprintf("[%s] %s: %s\n", msg.Timestamp, user, content))
+	}
+
+	messageMutex.Unlock()
+}
+
+func (h *Handler) getLastMessages(n int) []Message {
+	messageMutex.Lock()
+	defer messageMutex.Unlock()
+
+	if len(messageStore) <= n {
+		return messageStore
+	}
+	return messageStore[len(messageStore)-n:]
+}
+
+func sendErr(ch chan error, err error) {
+	if ch != nil {
+		ch <- err
+		// Do NOT close the channel here!
+	}
+}
+
+func (h *Handler) debugf(format string, args ...interface{}) {
 	if h.output == nil || !config.Debug {
 		return
 	}
-
-	// Prepend the debug info prefix.
-	f := fmt.Sprintf("(dbg) %s\n", format)
-
-	// Write to the output according to running configuration.
-	fmt.Fprintf(h.output, f, args...)
+	fmt.Fprintf(h.output, "(dbg) "+format+"\n", args...)
 }
 
-// Common basic logging wrapper function.
-func (h *Handler) logf(format string, args ...any) {
+func (h *Handler) logf(format string, args ...interface{}) {
 	if h.output == nil {
 		return
 	}
-
-	// Write to the output according to running configuration.
 	fmt.Fprintf(h.output, format+"\n", args...)
+}
+
+func (h *Handler) loadMessages() {
+	messageMutex.Lock()
+	defer messageMutex.Unlock()
+
+	messageStore = nil // Clear current store
+
+	data, err := os.ReadFile(messagesFile)
+	if err != nil {
+		return // No messages file yet
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Expected format: [YYYY-MM-DD HH:MM:SS] user: content
+		if len(line) < 22 || line[0] != '[' {
+			continue
+		}
+		endIdx := strings.Index(line, "]")
+		if endIdx == -1 {
+			continue
+		}
+		timestamp := line[1:endIdx]
+		rest := strings.TrimSpace(line[endIdx+1:])
+		colonIdx := strings.Index(rest, ":")
+		if colonIdx == -1 {
+			continue
+		}
+		user := strings.TrimSpace(rest[:colonIdx])
+		content := strings.TrimSpace(rest[colonIdx+1:])
+		messageStore = append(messageStore, Message{
+			User:      user,
+			Timestamp: timestamp,
+			Content:   content,
+		})
+	}
 }
