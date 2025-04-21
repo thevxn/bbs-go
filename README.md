@@ -17,7 +17,7 @@ telnet localhost 2323
 |                                           |
 +-------------------------------------------+
 vxn-dev bbs-go service (0.6.1)
-telnet localhost 5555
+telnet localhost 2323
 
 > test
 *** Invalid command
