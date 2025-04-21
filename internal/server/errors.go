@@ -5,5 +5,5 @@ import (
 )
 
 var (
-	ErrShutdownStarted = errors.New("the server shutdown process has been already started")
+	ErrShutdownStarted = errors.New("The server shutdown process has been already started")
 )
